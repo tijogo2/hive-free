@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# FreeHive __VERSION__ - instalador self-contained para DeepAI Code (pi) em Linux / macOS / Git Bash.
+#
+# Este arquivo ja carrega a extensao embutida (base64). Nao baixa nada, nao precisa de
+# Node/npm: o pi transpila TypeScript em tempo de carga.
+#
+# Instalar (uma linha, direto de uma URL):
+#   curl -fsSL https://raw.githubusercontent.com/SEU-USUARIO/free-hive/main/install.sh | bash
+#
+# Instalar a partir de um arquivo baixado:
+#   chmod +x install.sh && ./install.sh
+#
+# Opcoes:
+#   --include-memory          copia tambem a pasta ./memory, se existir
+#   --uninstall               remove a extensao (guarda copia .removed-<data>)
+#   --dry-run                 mostra o que faria, sem alterar nada
+#   --agent-dir <dir>         forca o diretorio de agente do pi
+#   --memory-dir <dir>        forca o diretorio da memoria
+#   env: FREEHIVE_AGENT_DIR, FREEHIVE_MEMORY_DIR, PI_CODING_AGENT_DIR
+
+set -euo pipefail
+
+VERSION="__VERSION__"
+EXPECTED_MODELS="mimo-2.6-pro deepseek-v4.1-flash glm-5.3-flash mimo-2.6-flash gpt-6-luna crouton-alpha glyph-cluster solar-mini-4 deepai-cyber"
+USERDATA="$HOME/.deepai-code/userdata"
+
+HERE=""
+if [ -n "${BASH_SOURCE:-}" ] && [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+  HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+
+AGENT_DIR="${FREEHIVE_AGENT_DIR:-}"
+MEMORY_DIR="${FREEHIVE_MEMORY_DIR:-}"
+INCLUDE_MEMORY=0
+UNINSTALL=0
+DRY_RUN=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --include-memory) INCLUDE_MEMORY=1 ;;
+    --uninstall)      UNINSTALL=1 ;;
+    --dry-run)        DRY_RUN=1 ;;
+    --agent-dir)      shift; AGENT_DIR="${1:-}" ;;
+    --memory-dir)     shift; MEMORY_DIR="${1:-}" ;;
+    -h|--help)        sed -n '2,24p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "Argumento desconhecido: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# --- extensao embutida: zip -> base64 (gerado por build.ps1) -------------------
+PAYLOAD_B64="$(cat <<'__FREEHIVE_B64__'
+__FREEHIVE_B64_PAYLOAD__
+__FREEHIVE_B64__
+)"
+PAYLOAD_B64="$(printf '%s' "$PAYLOAD_B64" | tr -d '[:space:]')"
+
+TMP=""
+cleanup() { [ -n "$TMP" ] && rm -rf "$TMP"; }
+trap cleanup EXIT
+
+need_tmp() {
+  [ -n "$TMP" ] || TMP="$(mktemp -d "${TMPDIR:-/tmp}/free-hive.XXXXXX")"
+}
+
+b64decode() {
+  local out="$1" src="$TMP/payload.b64"
+  printf '%s' "$PAYLOAD_B64" > "$src"
+  base64 -d < "$src" > "$out" 2>/dev/null && return 0
+  base64 -D < "$src" > "$out" 2>/dev/null && return 0
+  base64 --decode < "$src" > "$out" 2>/dev/null && return 0
+  openssl base64 -d -A -in "$src" -out "$out" 2>/dev/null && return 0
+  echo "Nao consegui decodificar o payload (base64/openssl ausentes)." >&2
+  return 1
+}
+
+unzip_to() {
+  local zip="$1" dest="$2"
+  mkdir -p "$dest"
+  unzip -q "$zip" -d "$dest" 2>/dev/null || true
+  [ -f "$dest/free-hive/index.ts" ] && return 0
+  python3 -c 'import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$zip" "$dest" 2>/dev/null || true
+  [ -f "$dest/free-hive/index.ts" ] && return 0
+  tar -xf "$zip" -C "$dest" 2>/dev/null || true
+  [ -f "$dest/free-hive/index.ts" ] && return 0
+  echo "Nao consegui extrair o pacote (instale unzip ou python3)." >&2
+  return 1
+}
+
+source_dir() {
+  if [ -n "$HERE" ] && [ -f "$HERE/src/free-hive/index.ts" ]; then
+    printf '%s\n' "$HERE/src/free-hive"
+    return
+  fi
+  [ -n "$PAYLOAD_B64" ] || { echo "Payload embutido vazio: gere o instalador com build.ps1." >&2; exit 1; }
+  need_tmp
+  b64decode "$TMP/payload.zip"
+  unzip_to "$TMP/payload.zip" "$TMP/x"
+  [ -f "$TMP/x/free-hive/index.ts" ] || { echo "Payload invalido: index.ts ausente." >&2; exit 1; }
+  printf '%s\n' "$TMP/x/free-hive"
+}
+
+resolve_agent_dir() {
+  if [ -n "$AGENT_DIR" ]; then
+    [ -d "$AGENT_DIR" ] || { echo "AgentDir nao existe: $AGENT_DIR" >&2; exit 1; }
+    (cd "$AGENT_DIR" && pwd)
+    return
+  fi
+  if [ -n "${PI_CODING_AGENT_DIR:-}" ] && [ -d "$PI_CODING_AGENT_DIR" ]; then
+    (cd "$PI_CODING_AGENT_DIR" && pwd)
+    return
+  fi
+  [ -d "$USERDATA" ] || { echo "Nao achei $USERDATA. Abra o DeepAI Code uma vez (com login) antes de instalar." >&2; exit 1; }
+
+  local best="" best_time=0 dir time
+  for dir in "$USERDATA"/*/pi/*; do
+    [ -d "$dir" ] || continue
+    if [ -f "$dir/models.json" ] || [ -d "$dir/sessions" ]; then
+      time=$(stat -c %Y "$dir" 2>/dev/null || stat -f %m "$dir" 2>/dev/null || echo 0)
+      if [ "$time" -ge "$best_time" ]; then best_time="$time"; best="$dir"; fi
+    fi
+  done
+  if [ -n "$best" ]; then printf '%s\n' "$best"; return; fi
+  printf '%s\n' "$USERDATA/deepai/pi/deepai"
+}
+
+show_model_check() {
+  local dir="$1" file="$1/models.json" missing="" model
+  if [ ! -f "$file" ]; then
+    echo "Aviso: $file nao existe - o app ainda nao foi inicializado nesta maquina."
+    echo "       Abra o DeepAI Code e faca login antes de usar o plugin."
+    return
+  fi
+  for model in $EXPECTED_MODELS; do
+    grep -q "\"$model\"" "$file" || missing="$missing $model"
+  done
+  if [ -z "$missing" ]; then
+    echo "Catalogo OK: os 9 modelos gratuitos estao disponiveis."
+  else
+    echo "Aviso: modelos gratuitos ausentes nesta conta:$missing"
+    echo "       O enxame usa os que existirem; '/hive models' mostra a lista."
+  fi
+}
+
+# ------------------------------------------------------------------ principal
+
+echo "FreeHive $VERSION (instalador self-contained)"
+
+AGENT_DIR_RESOLVED="$(resolve_agent_dir)"
+EXTENSIONS_DIR="$AGENT_DIR_RESOLVED/extensions"
+TARGET_DIR="$EXTENSIONS_DIR/free-hive"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+
+echo "Diretorio do agente: $AGENT_DIR_RESOLVED"
+echo "Destino da extensao: $TARGET_DIR"
+
+if [ "$UNINSTALL" -eq 1 ]; then
+  if [ ! -d "$TARGET_DIR" ]; then
+    echo "Nada para remover: $TARGET_DIR nao existe."
+    exit 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then echo "[dry-run] moveria $TARGET_DIR para $TARGET_DIR.removed-$STAMP"; exit 0; fi
+  mv "$TARGET_DIR" "$TARGET_DIR.removed-$STAMP"
+  echo "Extensao removida (guardada em $TARGET_DIR.removed-$STAMP)."
+  echo "Reinicie o DeepAI Code para descarregar o plugin."
+  exit 0
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "[dry-run] copiaria a extensao embutida para $TARGET_DIR"
+  exit 0
+fi
+
+SRC="$(source_dir)"
+
+mkdir -p "$EXTENSIONS_DIR"
+if [ -d "$TARGET_DIR" ]; then
+  mv "$TARGET_DIR" "$TARGET_DIR.bak-$STAMP"
+  echo "Versao anterior guardada em: $TARGET_DIR.bak-$STAMP"
+fi
+mkdir -p "$TARGET_DIR"
+cp -R "$SRC/." "$TARGET_DIR/"
+count="$(cd "$TARGET_DIR" && ls ./*.ts 2>/dev/null | wc -l | tr -d ' ')"
+[ "$count" -gt 0 ] || { echo "Nenhum .ts copiado para $TARGET_DIR" >&2; exit 1; }
+echo "Instalado: $(cd "$TARGET_DIR" && ls *.ts | tr '\n' ' ')"
+
+[ -n "$MEMORY_DIR" ] || MEMORY_DIR="$HOME/.deepai-code/free-hive"
+if [ "$INCLUDE_MEMORY" -eq 1 ] && [ -n "$HERE" ] && [ -d "$HERE/memory" ]; then
+  mkdir -p "$MEMORY_DIR"
+  cp -R "$HERE/memory/." "$MEMORY_DIR/"
+  echo "Memoria copiada para: $MEMORY_DIR"
+elif [ "$INCLUDE_MEMORY" -eq 1 ]; then
+  echo "Aviso: --include-memory sem pasta 'memory' ao lado do instalador - nada a copiar."
+fi
+if [ ! -d "$MEMORY_DIR" ]; then
+  mkdir -p "$MEMORY_DIR"
+  echo "Memoria vazia criada em: $MEMORY_DIR"
+fi
+
+echo
+show_model_check "$AGENT_DIR_RESOLVED"
+
+echo
+echo "Pronto."
+echo "Proximos passos:"
+echo "  1. Feche e abra o DeepAI Code (ou abra uma thread nova)."
+echo "  2. Digite /hive stats  -> deve mostrar FreeHive e o caminho da memoria."
+echo "  3. Digite /hive models -> confirma os gratuitos disponiveis."
+echo "  4. Desligar o modo automatico: /hive auto off   (voltar: /hive auto on)"

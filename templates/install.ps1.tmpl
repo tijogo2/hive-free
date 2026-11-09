@@ -1,0 +1,207 @@
+<#
+  FreeHive __VERSION__ - instalador self-contained para DeepAI Code (pi) no Windows.
+
+  Este arquivo ja carrega a extensao embutida (base64). Nao baixa nada, nao precisa de
+  Node/npm, nao precisa de package.json: o pi transpila TypeScript em tempo de carga.
+
+  Instalar (uma linha, direto de uma URL):
+    irm https://raw.githubusercontent.com/SEU-USUARIO/free-hive/main/install.ps1 | iex
+
+  Instalar a partir de um arquivo baixado:
+    powershell -ExecutionPolicy Bypass -File .\install.ps1
+
+  Opcoes (arquivo) / variaveis de ambiente (modo pipe):
+    -IncludeMemory          copia tambem a pasta .\memory, se existir
+    -Uninstall              remove a extensao (guarda copia .removed-<data>)
+    -DryRun                 mostra o que faria, sem alterar nada
+    -AgentDir <dir>         forca o diretorio de agente do pi
+    -MemoryDir <dir>        forca o diretorio da memoria
+    env: FREEHIVE_AGENT_DIR, FREEHIVE_MEMORY_DIR
+#>
+[CmdletBinding()]
+param(
+  [switch]$IncludeMemory,
+  [switch]$Uninstall,
+  [switch]$DryRun,
+  [string]$AgentDir = $env:FREEHIVE_AGENT_DIR,
+  [string]$MemoryDir = $env:FREEHIVE_MEMORY_DIR
+)
+
+$ErrorActionPreference = 'Stop'
+$Version = '__VERSION__'
+
+# --- extensao embutida: zip -> base64 (gerado por build.ps1) -------------------
+$PayloadB64 = @'
+__FREEHIVE_B64_PAYLOAD__
+'@
+
+$ExpectedModels = @(
+  'mimo-2.6-pro', 'deepseek-v4.1-flash', 'glm-5.3-flash', 'mimo-2.6-flash',
+  'gpt-6-luna', 'crouton-alpha', 'glyph-cluster', 'solar-mini-4', 'deepai-cyber'
+)
+
+function Write-Info($msg)  { Write-Host $msg }
+function Write-Ok($msg)    { Write-Host $msg -ForegroundColor Green }
+function Write-Warn2($msg) { Write-Host $msg -ForegroundColor Yellow }
+
+function Resolve-AgentDirectory {
+  param([string]$Explicit)
+
+  if ($Explicit) {
+    if (-not (Test-Path -LiteralPath $Explicit)) { throw "AgentDir nao existe: $Explicit" }
+    return (Resolve-Path -LiteralPath $Explicit).Path
+  }
+  if ($env:PI_CODING_AGENT_DIR -and (Test-Path -LiteralPath $env:PI_CODING_AGENT_DIR)) {
+    return (Resolve-Path -LiteralPath $env:PI_CODING_AGENT_DIR).Path
+  }
+
+  $userdata = Join-Path $env:USERPROFILE '.deepai-code\userdata'
+  if (-not (Test-Path -LiteralPath $userdata)) {
+    throw "Nao achei $userdata. Abra o DeepAI Code uma vez (com login) antes de instalar."
+  }
+
+  $found = @()
+  foreach ($inst in (Get-ChildItem -LiteralPath $userdata -Directory -ErrorAction SilentlyContinue)) {
+    $piDir = Join-Path $inst.FullName 'pi'
+    if (-not (Test-Path -LiteralPath $piDir)) { continue }
+    foreach ($agent in (Get-ChildItem -LiteralPath $piDir -Directory -ErrorAction SilentlyContinue)) {
+      $hasConfig = (Test-Path -LiteralPath (Join-Path $agent.FullName 'models.json')) -or
+                   (Test-Path -LiteralPath (Join-Path $agent.FullName 'sessions'))
+      if ($hasConfig) {
+        $found += [pscustomobject]@{ Path = $agent.FullName; Updated = (Get-Item -LiteralPath $agent.FullName).LastWriteTime }
+      }
+    }
+  }
+  if ($found.Count -gt 0) {
+    return ($found | Sort-Object Updated -Descending | Select-Object -First 1).Path
+  }
+  return (Join-Path $userdata 'deepai\pi\deepai')
+}
+
+function Get-SourceDir {
+  param([string]$ExtractRoot)
+
+  if ($PSScriptRoot) {
+    $local = Join-Path $PSScriptRoot 'src\free-hive'
+    if (Test-Path -LiteralPath (Join-Path $local 'index.ts')) { return $local }
+  }
+
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  $payload = ($PayloadB64 -replace '\s', '')
+  if (-not $payload) { throw 'Payload embutido vazio: gere o instalador com build.ps1.' }
+  $zip = Join-Path $ExtractRoot 'payload.zip'
+  [IO.File]::WriteAllBytes($zip, [Convert]::FromBase64String($payload))
+  [IO.Compression.ZipFile]::ExtractToDirectory($zip, $ExtractRoot)
+
+  $dir = Join-Path $ExtractRoot 'free-hive'
+  if (-not (Test-Path -LiteralPath (Join-Path $dir 'index.ts'))) { throw 'Payload invalido: index.ts ausente.' }
+  return $dir
+}
+
+function Show-ModelCheck {
+  param([string]$Dir)
+  $modelsFile = Join-Path $Dir 'models.json'
+  if (-not (Test-Path -LiteralPath $modelsFile)) {
+    Write-Warn2 "Aviso: $modelsFile nao existe - o app ainda nao foi inicializado nesta maquina."
+    Write-Warn2 '       Abra o DeepAI Code e faca login antes de usar o plugin.'
+    return
+  }
+  try {
+    $json = Get-Content -LiteralPath $modelsFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    $ids = @()
+    foreach ($provider in $json.providers.PSObject.Properties) {
+      foreach ($model in $provider.Value.models) { $ids += $model.id }
+    }
+    $missing = @($ExpectedModels | Where-Object { $ids -notcontains $_ })
+    if ($missing.Count -eq 0) {
+      Write-Ok 'Catalogo OK: os 9 modelos gratuitos estao disponiveis.'
+    } else {
+      Write-Warn2 ('Aviso: modelos gratuitos ausentes nesta conta: ' + ($missing -join ', '))
+      Write-Warn2 "       O enxame usa os que existirem; '/hive models' mostra a lista."
+    }
+  } catch {
+    Write-Warn2 "Aviso: nao consegui ler $modelsFile ($($_.Exception.Message))."
+  }
+}
+
+# ------------------------------------------------------------------ principal
+
+Write-Info "FreeHive $Version (instalador self-contained)"
+
+$AgentDirResolved = Resolve-AgentDirectory -Explicit $AgentDir
+$ExtensionsDir    = Join-Path $AgentDirResolved 'extensions'
+$TargetDir        = Join-Path $ExtensionsDir 'free-hive'
+$Stamp            = Get-Date -Format 'yyyyMMdd-HHmmss'
+
+Write-Info "Diretorio do agente: $AgentDirResolved"
+Write-Info "Destino da extensao: $TargetDir"
+
+if ($Uninstall) {
+  if (-not (Test-Path -LiteralPath $TargetDir)) {
+    Write-Warn2 "Nada para remover: $TargetDir nao existe."
+    return
+  }
+  if ($DryRun) { Write-Info "[dry-run] moveria $TargetDir para $TargetDir.removed-$Stamp"; return }
+  Move-Item -LiteralPath $TargetDir -Destination "$TargetDir.removed-$Stamp"
+  Write-Ok "Extensao removida (guardada em $TargetDir.removed-$Stamp)."
+  Write-Info 'Reinicie o DeepAI Code para descarregar o plugin.'
+  return
+}
+
+if ($DryRun) {
+  Write-Info "[dry-run] copiaria a extensao embutida para $TargetDir"
+  return
+}
+
+$TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("free-hive-" + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $TempRoot -Force | Out-Null
+
+try {
+  $SourceDir = Get-SourceDir -ExtractRoot $TempRoot
+
+  if (-not (Test-Path -LiteralPath $ExtensionsDir)) {
+    New-Item -ItemType Directory -Path $ExtensionsDir -Force | Out-Null
+  }
+  if (Test-Path -LiteralPath $TargetDir) {
+    Move-Item -LiteralPath $TargetDir -Destination "$TargetDir.bak-$Stamp"
+    Write-Info "Versao anterior guardada em: $TargetDir.bak-$Stamp"
+  }
+  New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
+  Copy-Item -Path (Join-Path $SourceDir '*') -Destination $TargetDir -Recurse -Force
+
+  $installed = @(Get-ChildItem -LiteralPath $TargetDir -Filter '*.ts' | Sort-Object Name)
+  if ($installed.Count -eq 0) { throw "Nenhum .ts copiado para $TargetDir" }
+  Write-Ok ('Instalado: ' + ($installed.Name -join ', '))
+
+  if (-not $MemoryDir) { $MemoryDir = Join-Path $env:USERPROFILE '.deepai-code\free-hive' }
+  if ($IncludeMemory) {
+    $memorySource = $null
+    if ($PSScriptRoot -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'memory'))) {
+      $memorySource = Join-Path $PSScriptRoot 'memory'
+    }
+    if ($memorySource) {
+      New-Item -ItemType Directory -Path $MemoryDir -Force | Out-Null
+      Copy-Item -Path (Join-Path $memorySource '*') -Destination $MemoryDir -Recurse -Force
+      Write-Ok "Memoria copiada para: $MemoryDir"
+    } else {
+      Write-Warn2 "Aviso: -IncludeMemory sem pasta 'memory' ao lado do instalador - nada a copiar."
+    }
+  }
+  if (-not (Test-Path -LiteralPath $MemoryDir)) {
+    New-Item -ItemType Directory -Path $MemoryDir -Force | Out-Null
+    Write-Info "Memoria vazia criada em: $MemoryDir"
+  }
+
+  Write-Info ''
+  Show-ModelCheck -Dir $AgentDirResolved
+
+  Write-Info ''
+  Write-Ok 'Pronto.'
+  Write-Info 'Proximos passos:'
+  Write-Info '  1. Feche e abra o DeepAI Code (ou abra uma thread nova).'
+  Write-Info '  2. Digite /hive stats  -> deve mostrar FreeHive e o caminho da memoria.'
+  Write-Info '  3. Digite /hive models -> confirma os gratuitos disponiveis.'
+  Write-Info '  4. Desligar o modo automatico: /hive auto off   (voltar: /hive auto on)'
+} finally {
+  Remove-Item -LiteralPath $TempRoot -Recurse -Force -ErrorAction SilentlyContinue
+}

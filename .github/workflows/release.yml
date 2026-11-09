@@ -1,0 +1,37 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build installers + zip
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content ./VERSION -Raw).Trim()
+          $tag = "v$version"
+          $zip = "./dist/free-hive-$version.zip"
+          $sha = "$zip.sha256"
+          if (-not (Test-Path $zip)) { throw "build nao gerou $zip" }
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip $sha --clobber
+          } else {
+            gh release create $tag $zip $sha --title "FreeHive $version" --notes "Instale em uma linha:`n``irm https://raw.githubusercontent.com/${{ github.repository }}/$tag/install.ps1 | iex``"
+          }
