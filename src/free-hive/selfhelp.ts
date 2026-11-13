@@ -27,6 +27,8 @@ export interface RepoHit {
   archived: boolean;
   score: number;
   install?: string;
+  /** motivo de o comando de instalacao ter sido recusado pelo piso de supply-chain */
+  installRisk?: string;
 }
 
 interface CacheEntry { at: number; data: RepoHit[] }
@@ -44,14 +46,63 @@ function ghHeaders(): Record<string, string> {
   return h;
 }
 
+// ------------------------------------------------------- supply-chain floor
+
+/**
+ * P0: piso de supply-chain. O FreeHive nunca sugere instalacao que fuja de
+ * registro publico: sem `install --git`, sem `curl|bash`, sem script solto de URL.
+ */
+const UNSAFE_INSTALL: ReadonlyArray<{ re: RegExp; why: string }> = [
+  { re: /\b(install|add|cargo)\s+--git\b/i, why: "instalacao direta de repo (--git) nao passa por registro publico" },
+  { re: /\bgit\+https?:\/\//i, why: "dependencia apontando para VCS cru (git+http)" },
+  { re: /\b(curl|wget|irm|iwr|invoke-webrequest)\b[\s\S]{0,200}?\|\s*(bash|sh|zsh|dash|iex|powershell|pwsh)\b/i, why: "pipe de download direto para shell (curl|bash)" },
+  { re: /\b(bash|sh|zsh)\s*<\s*\(/i, why: "execucao de script baixado em voo" },
+  { re: /https?:\/\/[^\s"']+\.(sh|ps1|bat|cmd)\b/i, why: "script solto de URL, fora de registro" },
+  { re: /\bnpm\s+(i|install|add)\b[^\n]*\b(git|github|gitlab|bitbucket|https?:)/i, why: "npm instalando de VCS/URL em vez de registro" },
+  { re: /\bpip3?\s+install\b[^\n]*\bgit\+/i, why: "pip instalando de git+" },
+];
+
+const REGISTRY_HINT = /\b(npm|npx|pnpm|yarn|bun|pipx|pip3?|uv|cargo|go\s+install|winget|scoop|choco|brew|apt(?:-get)?|dnf|pacman|gem|dotnet\s+tool|deno)\b/i;
+
+export interface InstallCheck {
+  ok: boolean;
+  reason?: string;
+  harden?: string;
+}
+
+/** valida o comando de instalacao sugerido contra o piso de supply-chain */
+export function supplyChainCheck(install: string | undefined): InstallCheck {
+  const cmd = String(install ?? "").replace(/#.*$/, "").trim();
+  if (!cmd) return { ok: true };
+  for (const u of UNSAFE_INSTALL) {
+    if (u.re.test(cmd)) {
+      return {
+        ok: false,
+        reason: u.why,
+        harden: "instale pelo gerenciador do ecossistema com o pacote publicado em registro publico (npm/PyPI/crates.io/Go proxy/winget/scoop/choco)",
+      };
+    }
+  }
+  if (!REGISTRY_HINT.test(cmd)) {
+    return {
+      ok: false,
+      reason: "comando fora de registro publico conhecido",
+      harden: "prefira npm/npx, pipx/uv, cargo, go install (via proxy), winget/scoop/choco/brew",
+    };
+  }
+  return { ok: true };
+}
+
 function guessInstall(repo: RepoHit): string | undefined {
   const n = repo.fullName.toLowerCase();
   const lang = (repo.language ?? "").toLowerCase();
   if (n.includes("awesome-")) return undefined;
-  if (lang === "rust") return `cargo install --git ${repo.url}`;
-  if (lang === "go") return `go install ${repo.fullName}@latest`;
-  if (lang === "python") return `pipx install ${path.basename(repo.fullName)}  # ou: uv tool install ...`;
-  if (lang === "javascript" || lang === "typescript") return `npx ${path.basename(repo.fullName)}  # ou: npm i -g ...`;
+  // so registro publico: nada de --git, nada de curl|bash (piso de supply-chain).
+  // Versao pinada: `@latest` pega HEAD/tag movel; o comando lembra de fixar a versao.
+  if (lang === "rust") return `cargo install ${path.basename(repo.fullName)} --locked  # confira a versao no crates.io e fixe (ex.: --version <x.y.z>)`;
+  if (lang === "go") return `go install ${repo.fullName}@vX.Y.Z  # troque vX.Y.Z pela tag exata (via proxy.golang.org); @latest pega HEAD`;
+  if (lang === "python") return `pipx install ${path.basename(repo.fullName)}  # confirme o nome exato no PyPI antes (risco de typosquat)`;
+  if (lang === "javascript" || lang === "typescript") return `npx ${path.basename(repo.fullName)}@X.Y.Z  # fixe a versao; npx sem versao pega latest`;
   return undefined;
 }
 
@@ -98,6 +149,12 @@ export async function searchGithub(
       score: Math.round(score * 100) / 100,
     };
     hit.install = guessInstall(hit);
+    // piso de supply-chain: sugestao recusada nao vira comando — vira risco documentado
+    const chk = supplyChainCheck(hit.install);
+    if (hit.install && !chk.ok) {
+      hit.installRisk = `${chk.reason} — ${chk.harden}`;
+      hit.install = undefined;
+    }
     return hit;
   });
   const ranked = hits.sort((a, b) => b.score - a.score).slice(0, limit);
@@ -281,7 +338,7 @@ export function formatEscalation(e: Escalation): string {
     for (const c of e.candidates) {
       L.push(`- ${c.fullName} ★${c.stars} · ${c.language ?? "?"} · atualizado ${c.updated}${c.archived ? " · ARQUIVADO" : ""}`);
       L.push(`  ${c.description || "(sem descricao)"}`);
-      L.push(`  ${c.url}${c.install ? `\n  instalar: ${c.install}` : ""}`);
+      L.push(`  ${c.url}${c.install ? `\n  instalar: ${c.install}` : ""}${c.installRisk ? `\n  instalacao BLOQUEADA pelo piso de supply-chain: ${c.installRisk}` : ""}`);
     }
   }
   return L.join("\n");

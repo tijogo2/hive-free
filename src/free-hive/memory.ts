@@ -25,6 +25,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as crypto from "node:crypto";
+import { auditAppend, redactSecrets } from "./security.ts";
+import type { ModelVerdict, TaskKind } from "./catalog.ts";
+
+const HIVE_SOURCE = "desempenho";
 
 export type PageType =
   | "decision"
@@ -80,7 +84,7 @@ export interface Page {
   lastUsed?: string;
   owner?: string;
   status?: string;
-  /** pagina sintetica usada para o briefing */
+  /** resumo de uma linha (progressive disclosure): aparece no briefing antes do corpo */
   summary?: string;
 }
 
@@ -90,6 +94,8 @@ export interface QueryHit {
   type: PageType;
   score: number;
   snippet: string;
+  /** resumo de uma linha da pagina, quando existe */
+  summary?: string;
   stale: boolean;
   uses: number;
 }
@@ -103,6 +109,8 @@ export interface WriteInput {
   relations?: Relations;
   /** id/titulo de pagina que esta substitui */
   supersedes?: string;
+  /** resumo de uma linha exibido no briefing/busca; corpo so carrega sob demanda */
+  summary?: string;
 }
 
 // ---------------------------------------------------------------- utilidades
@@ -112,6 +120,29 @@ const STOP = new Set(
     "the a an and or of to in on for with is are was were be been it its this that these those " +
     "como mais muito quando onde qual quais sobre entre ja foi ser seu sua eu voce").split(/\s+/),
 );
+
+/** limites defensivos: pagina gigante vira contexto gigante na proxima sessao */
+const MAX_TITLE = 200;
+const MAX_BODY = 200_000;
+const MAX_TAGS = 32;
+const MAX_TAG_LEN = 64;
+const MAX_SOURCES = 24;
+const MAX_SUMMARY = 240;
+
+/**
+ * sanitiza escalar que vai para o frontmatter: quebra de linha/controle aqui
+ * seria injecao de chaves (ex.: tag com " + "\n" + " e " + "valid_to:" fabricaria validade falsa).
+ */
+function frontmatterSafe(s: string, max = 200): string {
+  return String(s).replace(/[\r\n\u0000-\u001f\u007f]+/g, " ").trim().slice(0, max);
+}
+
+/** escrita atomica: leitor nunca ve arquivo pela metade */
+function writeAtomic(file: string, data: string): void {
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, file);
+}
 
 export function slugify(s: string, max = 48): string {
   return s
@@ -190,26 +221,26 @@ function inlineList(raw: string): string[] {
 export function renderPage(p: Page): string {
   const L: string[] = ["---"];
   L.push(`type: ${p.type}`);
-  L.push(`title: ${p.title.replace(/\n/g, " ")}`);
+  L.push(`title: ${frontmatterSafe(p.title, MAX_TITLE)}`);
   L.push(`created: ${p.created}`);
   L.push(`valid_from: ${p.validFrom}`);
   if (p.validTo) L.push(`valid_to: ${p.validTo}`);
   L.push(`stale_after: ${p.staleAfter}`);
-  L.push(`tags: [${p.tags.join(", ")}]`);
-  L.push(`sources: [${p.sources.map((s) => JSON.stringify(s)).join(", ")}]`);
+  L.push(`tags: [${p.tags.map((t) => frontmatterSafe(t, MAX_TAG_LEN)).join(", ")}]`);
+  L.push(`sources: [${p.sources.map((s) => JSON.stringify(frontmatterSafe(s, 300))).join(", ")}]`);
   const rel = p.relations ?? {};
   const relLines = Object.entries(rel).filter(([, v]) => v && v.length);
   if (relLines.length) {
     L.push("relations:");
-    for (const [k, v] of relLines) L.push(`  ${k}: [${(v as string[]).join(", ")}]`);
+    for (const [k, v] of relLines) L.push(`  ${k}: [${(v as string[]).map((t) => frontmatterSafe(t, 120)).join(", ")}]`);
   } else {
     L.push("relations: {}");
   }
   L.push(`uses: ${p.uses}`);
   if (p.lastUsed) L.push(`last_used: ${p.lastUsed}`);
-  if (p.owner) L.push(`owner: ${p.owner}`);
-  if (p.status) L.push(`status: ${p.status}`);
-  if (p.summary) L.push(`summary: ${JSON.stringify(p.summary)}`);
+  if (p.owner) L.push(`owner: ${frontmatterSafe(p.owner, 120)}`);
+  if (p.status) L.push(`status: ${frontmatterSafe(p.status, 40)}`);
+  if (p.summary) L.push(`summary: ${JSON.stringify(frontmatterSafe(p.summary, MAX_SUMMARY))}`);
   L.push("---");
   return `${L.join("\n")}\n${p.body.trim()}\n`;
 }
@@ -268,6 +299,12 @@ interface IndexedPage {
   tokens: Set<string>;
 }
 
+interface CacheEntry {
+  mtimeMs: number;
+  size: number;
+  entry: IndexedPage;
+}
+
 export interface StoreOptions {
   /** raiz da memoria; default ~/.deepai-code/free-hive */
   root?: string;
@@ -294,6 +331,32 @@ export function projectName(cwd: string): string {
 }
 
 /** chave tolerante: slug do nome do arquivo sem pasta e sem extensao */
+/** o processo dono do lock ainda existe? (kill(pid, 0) nao mata, so consulta) */
+function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    // EPERM = processo existe mas nao e nosso; so ESRCH prova morte
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** lock so e roubado se o dono esta morto ou se o arquivo passou de 60s sem refresh */
+function lockOwnerIsDeadOrStale(lockPath: string): boolean {
+  try {
+    const raw = fs.readFileSync(lockPath, "utf8");
+    const pid = Number.parseInt(raw.trim().split(/\s+/)[0] ?? "", 10);
+    const ageMs = Date.now() - fs.statSync(lockPath).mtimeMs;
+    if (Number.isInteger(pid) && pidAlive(pid) && ageMs < 60_000) return false;
+    return true;
+  } catch {
+    return true; // lock ilegivel/desaparecido: pode ser removido
+  }
+}
+
 export function normKey(s: string): string {
   const base = String(s).replace(/\.md$/i, "").split("/").filter(Boolean).pop() ?? "";
   return slugify(base);
@@ -305,6 +368,7 @@ export class MemoryStore {
   readonly actor: string;
   readonly dir: string;
   private pages: IndexedPage[] = [];
+  private cache = new Map<string, CacheEntry>();
   private loaded = false;
   private loadedAt = 0;
   private df = new Map<string, number>();
@@ -337,18 +401,20 @@ export class MemoryStore {
       this.ensure();
       const lockPath = path.join(this.dir, ".write.lock");
       const deadline = Date.now() + 5_000;
-      const started = Date.now();
       let fd: number | undefined;
       while (fd === undefined) {
         try {
           fd = fs.openSync(lockPath, "wx");
-          fs.writeSync(fd, String(process.pid));
+          fs.writeSync(fd, `${process.pid} ${Date.now()}`);
         } catch {
-          if (Date.now() - started > 3_000) {
-            // lock orfao de um processo que morreu: libera e tenta de novo
+          // so quebra o lock se o dono estiver MORTO (PID sem processo vivo)
+          // ou se o lock for velho demais para ser legitimo. Lock de processo
+          // vivo nunca e roubado.
+          const stale = lockOwnerIsDeadOrStale(lockPath);
+          if (stale) {
             try { fs.unlinkSync(lockPath); } catch { /* alguem ja liberou */ }
           }
-          if (Date.now() > deadline) throw new Error("memory: lock de escrita indisponivel");
+          if (Date.now() > deadline) throw new Error("memory: lock de escrita indisponivel (dono vivo? veja .write.lock)");
           await new Promise((r) => setTimeout(r, 25));
         }
       }
@@ -385,8 +451,20 @@ export class MemoryStore {
     if (this.loaded && !force && Date.now() - this.loadedAt < RECARGA_MS) return;
     this.ensure();
     const files = this.walk(this.pagesDir);
+    const seen = new Set<string>();
     const pages: IndexedPage[] = [];
+    let reparsed = 0;
     for (const file of files) {
+      seen.add(file);
+      let stat: fs.Stats;
+      try { stat = fs.statSync(file); } catch { continue; }
+      // so reparsa/embeda o que mudou: pagina intocada reaproveita o indice
+      const hit = this.cache.get(file);
+      if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) {
+        pages.push(hit.entry);
+        continue;
+      }
+      reparsed++;
       let raw: string;
       try { raw = fs.readFileSync(file, "utf8"); } catch { continue; }
       const rel = path.relative(this.pagesDir, file).replace(/\\/g, "/");
@@ -396,7 +474,12 @@ export class MemoryStore {
       const toks = tokens(text);
       const tf = new Map<string, number>();
       for (const t of toks) tf.set(t, (tf.get(t) ?? 0) + 1);
-      pages.push({ page, tf, len: toks.length, vec: embed(text), tokens: new Set(toks) });
+      const entry: IndexedPage = { page, tf, len: toks.length, vec: embed(text), tokens: new Set(toks) };
+      this.cache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, entry });
+      pages.push(entry);
+    }
+    for (const key of [...this.cache.keys()]) {
+      if (!seen.has(key)) { this.cache.delete(key); reparsed++; }
     }
     this.pages = pages;
     this.df = new Map();
@@ -408,12 +491,15 @@ export class MemoryStore {
     this.avgLen = pages.length ? total / pages.length : 1;
     this.loaded = true;
     this.loadedAt = Date.now();
-    try {
-      fs.writeFileSync(
-        path.join(this.dir, "index-meta.json"),
-        JSON.stringify({ project: this.project, pages: pages.length, rebuiltAt: nowIso() }, null, 2),
-      );
-    } catch { /* indice e descartavel */ }
+    // meta e derivado/derivavel: so regrava quando o indice realmente mudou
+    if (reparsed > 0) {
+      try {
+        fs.writeFileSync(
+          path.join(this.dir, "index-meta.json"),
+          JSON.stringify({ project: this.project, pages: pages.length, rebuiltAt: nowIso() }, null, 2),
+        );
+      } catch { /* indice e descartavel */ }
+    }
   }
 
   all(): Page[] {
@@ -442,8 +528,23 @@ export class MemoryStore {
   async write(input: WriteInput, opts: { dedupe?: boolean } = {}): Promise<{ page: Page; action: "created" | "merged" | "superseded" }> {
     return this.locked(() => {
       this.load(true);
+      // entradas vindas da ferramenta sao nao-confiaveis: tipo e frontmatter sanitizados
+      const type: PageType = PAGE_TYPES.includes(input.type) ? input.type : "note";
+      // entrada e nao-confiavel: segredos sao redigidos ANTES de tocar o disco
+      const title = frontmatterSafe(redactSecrets(input.title), MAX_TITLE);
+      const body = redactSecrets(String(input.body ?? ""));
+      if (!title) throw new Error("memory: titulo vazio apos sanitizacao");
+      if (body.length > MAX_BODY) throw new Error(`memory: corpo excede ${MAX_BODY} caracteres (recorte antes de gravar)`);
+      const tags = (input.tags ?? []).slice(0, MAX_TAGS).map((t) => frontmatterSafe(t, MAX_TAG_LEN)).filter(Boolean);
+      const sources = (input.sources ?? []).slice(0, MAX_SOURCES).map((s) => frontmatterSafe(s, 300)).filter(Boolean);
+      const relations: Relations = {};
+      for (const [k, v] of Object.entries(input.relations ?? {})) {
+        if (!v?.length) continue;
+        (relations as Record<string, string[]>)[k] = v.slice(0, 24).map((t) => frontmatterSafe(t, 120)).filter(Boolean);
+      }
+      const summary = input.summary ? frontmatterSafe(input.summary, MAX_SUMMARY) : undefined;
       const dedupe = opts.dedupe !== false;
-      const text = `${input.title} ${input.body} ${(input.tags ?? []).join(" ")}`;
+      const text = `${title} ${body} ${tags.join(" ")}`;
       const toks = new Set(tokens(text));
       const vec = embed(text);
 
@@ -459,9 +560,9 @@ export class MemoryStore {
             p.lastUsed = nowIso();
             p.staleAfter = addDays(nowIso(), TTL_DAYS[p.type]);
             if (input.sources?.length) {
-              p.sources = [...new Set([...p.sources, ...input.sources])].slice(-12);
+              p.sources = [...new Set([...p.sources, ...sources])].slice(-12);
             }
-            fs.writeFileSync(path.join(this.pagesDir, p.rel), renderPage(p));
+            writeAtomic(path.join(this.pagesDir, p.rel), renderPage(p));
             this.load(true);
             return { page: p, action: "merged" as const };
           }
@@ -470,11 +571,11 @@ export class MemoryStore {
 
       // versiona a(s) pagina(s) substituida(s)
       const superseded: Page[] = [];
-      for (const target of input.relations?.supersedes ?? []) {
+      for (const target of relations.supersedes ?? []) {
         const old = this.find(target);
         if (!old || old.validTo) continue;
         old.validTo = nowIso();
-        fs.writeFileSync(path.join(this.pagesDir, old.rel), renderPage(old));
+        writeAtomic(path.join(this.pagesDir, old.rel), renderPage(old));
         const backup = path.join(this.versionsDir, `${old.rel.replace(/\.md$/, "")}@${Date.now()}.md`);
         fs.mkdirSync(path.dirname(backup), { recursive: true });
         try { fs.copyFileSync(path.join(this.pagesDir, old.rel), backup); } catch { /* opcional */ }
@@ -482,40 +583,52 @@ export class MemoryStore {
       }
 
       const ts = nowIso();
-      const rel = `${input.type}/${slugify(input.title)}.md`;
+      const rel = `${type}/${slugify(title)}.md`;
       const page: Page = {
         rel,
-        type: input.type,
-        title: input.title,
-        body: input.body,
+        type,
+        title,
+        body,
         created: ts,
         validFrom: ts,
-        staleAfter: addDays(ts, TTL_DAYS[input.type]),
-        tags: input.tags ?? [],
-        sources: input.sources ?? [],
-        relations: input.relations ?? {},
+        staleAfter: addDays(ts, TTL_DAYS[type]),
+        tags,
+        sources,
+        relations,
         uses: 0,
-        owner: input.type === "handoff" ? this.actor : undefined,
-        status: input.type === "handoff" ? "open" : undefined,
+        summary,
+        owner: type === "handoff" ? this.actor : undefined,
+        status: type === "handoff" ? "open" : undefined,
       };
       const full = path.join(this.pagesDir, rel);
       fs.mkdirSync(path.dirname(full), { recursive: true });
-      fs.writeFileSync(full, renderPage(page));
+      writeAtomic(full, renderPage(page));
+      auditAppend(this.dir, {
+        event: superseded.length ? "memory.supersede" : "memory.create",
+        rel,
+        type,
+        actor: this.actor,
+        superseded: superseded.map((s) => s.rel),
+      });
       this.load(true);
       return { page, action: superseded.length ? ("superseded" as const) : ("created" as const) };
     });
   }
 
-  markUsed(rels: readonly string[]): void {
+  /** atualiza metrica de uso sob o lock de escrita: sem lost-update contra outra sessao */
+  async markUsed(rels: readonly string[]): Promise<void> {
     if (!rels.length) return;
     try {
-      for (const rel of rels) {
-        const p = this.pages.find((x) => x.page.rel === rel)?.page;
-        if (!p) continue;
-        p.uses += 1;
-        p.lastUsed = nowIso();
-        fs.writeFileSync(path.join(this.pagesDir, p.rel), renderPage(p));
-      }
+      await this.locked(() => {
+        this.load(true);
+        for (const rel of rels) {
+          const p = this.pages.find((x) => x.page.rel === rel)?.page;
+          if (!p) continue;
+          p.uses += 1;
+          p.lastUsed = nowIso();
+          writeAtomic(path.join(this.pagesDir, p.rel), renderPage(p));
+        }
+      });
     } catch { /* metrica nao pode quebrar recall */ }
   }
 
@@ -622,32 +735,46 @@ export class MemoryStore {
       const idadeDias = (Date.now() - new Date(p.created).getTime()) / 86_400_000;
       const frescor = idadeDias < 7 ? 1.15 : idadeDias < 30 ? 1.05 : 1;
       const score = base * usado * (stale ? 0.85 : 1) * frescor;
-      hits.push({ rel, title: p.title, type: p.type, score, snippet: snippet(p), stale, uses: p.uses });
+      hits.push({ rel, title: p.title, type: p.type, score, snippet: snippet(p), summary: p.summary, stale, uses: p.uses });
     }
     return hits.sort((a, b) => b.score - a.score).slice(0, limit);
   }
 
-  /** briefing bounded de inicio de sessao (o que o proximo agente precisa saber) */
-  brief(limit = 10): string {
+  /**
+   * Briefing bounded (o que o proximo agente precisa saber).
+   * Com `query` (o pedido do turno), as paginas sao RANQUEADAS por relevancia em vez de
+   * "as 5 ultimas": mesmo orcamento de prompt, conteudo util no lugar de ruido.
+   */
+  brief(limit = 10, query?: string): string {
     this.load();
     const live = this.pages.map((p) => p.page).filter((p) => !p.validTo);
     const openHandoffs = live.filter((p) => p.type === "handoff" && (p.status ?? "open") !== "claimed");
-    const decisions = live.filter((p) => p.type === "decision").slice(-5);
-    const gotchas = live.filter((p) => p.type === "gotcha").slice(-5);
-    const procedures = live.filter((p) => p.type === "procedure").slice(-4);
+    const relevantes = query && query.trim().length > 8
+      ? this.query(query, { limit: limit * 2, includeStale: true })
+          .map((h) => this.pages.find((x) => x.page.rel === h.rel)?.page)
+          .filter((p): p is Page => Boolean(p) && !p!.validTo)
+      : [];
+    const porRelevancia = (tipo: PageType, n: number): Page[] => {
+      const doTipo = relevantes.filter((p) => p.type === tipo);
+      if (doTipo.length) return doTipo.slice(0, n);
+      return live.filter((p) => p.type === tipo).slice(-n);
+    };
+    const decisions = porRelevancia("decision", 5);
+    const gotchas = porRelevancia("gotcha", 5);
+    const procedures = porRelevancia("procedure", 4);
     const stale = live.filter((p) => isStale(p));
     const lines: string[] = [];
     lines.push(`Projeto: ${this.project} · ${live.length} paginas vivas · ${stale.length} vencidas`);
     if (openHandoffs.length) {
       lines.push("", "Handoffs abertos:");
       for (const h of openHandoffs.slice(0, limit)) {
-        lines.push(`- [${h.rel}] ${h.title}${h.owner ? ` (dono: ${h.owner})` : ""}`);
+        lines.push(`${briefLine(h)}${h.owner ? ` (dono: ${h.owner})` : ""}`);
       }
     }
     const sec = (label: string, list: Page[]) => {
       if (!list.length) return;
       lines.push("", `${label}:`);
-      for (const p of list) lines.push(`- [${p.rel}] ${p.title}`);
+      for (const p of list) lines.push(briefLine(p));
     };
     sec("Decisoes", decisions);
     sec("Gotchas", gotchas);
@@ -711,6 +838,79 @@ export class MemoryStore {
     return out.length ? out : ["limpo: nenhuma inconsistencia encontrada"];
   }
 
+  // ------------------------------------------------- aprendizado (model-profile)
+
+  /**
+   * Registra vitoria/derrota de um modelo num tipo de tarefa. Uma pagina
+   * model-profile por tipo guarda o placar; o router le isso em `verdicts()`.
+   * E o "cada linha e cicatriz" do artigo virado dado: o enxame aprende com o
+   * proprio resultado em vez de confiar so em benchmark publicado.
+   */
+  async recordOutcome(kind: string, modelId: string, ok: boolean): Promise<void> {
+    await this.locked(() => {
+      this.load(true);
+      const rel = `model-profile/desempenho-${slugify(kind, 24)}.md`;
+      const atual = this.pages.find((x) => x.page.rel === rel)?.page;
+      const placar = parsePlacar(atual?.body ?? "");
+      const slot = (placar[modelId] ??= { ok: 0, fail: 0, last: "" });
+      if (ok) slot.ok += 1;
+      else slot.fail += 1;
+      slot.last = nowIso();
+      const linhas = Object.entries(placar)
+        .sort((a, b) => b[1].ok + b[1].fail - (a[1].ok + a[1].fail))
+        .map(([m, v]) => `| ${m} | ${v.ok} | ${v.fail} | ${v.last.slice(0, 10)} |`);
+      const body = [
+        `Placar autoconsolidado de despachos do FreeHive para tarefas do tipo **${kind}**.`,
+        "Atualizado pelo proprio plugin depois de cada `hive run` (sem LLM: so contagem).",
+        "",
+        "| modelo | ok | falhas | ultimo |",
+        "|---|---|---|---|",
+        ...linhas,
+      ].join("\n");
+      const ts = atual?.created ?? nowIso();
+      const page: Page = {
+        rel,
+        type: "model-profile",
+        title: `Desempenho dos gratuitos em ${kind}`,
+        body,
+        created: ts,
+        validFrom: atual?.validFrom ?? ts,
+        staleAfter: addDays(nowIso(), TTL_DAYS["model-profile"]),
+        tags: ["model-profile", kind, "auto"],
+        sources: [`free-hive:${HIVE_SOURCE}`],
+        relations: {},
+        uses: atual?.uses ?? 0,
+        summary: `placar de ${Object.keys(placar).length} modelo(s) em ${kind}`,
+      };
+      const full = path.join(this.pagesDir, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      writeAtomic(full, renderPage(page));
+      this.load(true);
+    }).catch(() => undefined);
+  }
+
+  /**
+   * Vereditos aprendidos (minimo de amostras para nao reagir a ruido):
+   * taxa de sucesso >= 70% vira "bom", <= 35% vira "ruim".
+   */
+  verdicts(minSamples = 3, minRate = 0.7, maxRate = 0.35): ModelVerdict[] {
+    this.load();
+    const out: ModelVerdict[] = [];
+    for (const { page } of this.pages) {
+      if (page.type !== "model-profile" || page.validTo) continue;
+      const kind = (page.tags.find((t) => t !== "model-profile" && t !== "auto") ?? "") as TaskKind;
+      if (!kind) continue;
+      for (const [model, v] of Object.entries(parsePlacar(page.body))) {
+        const total = v.ok + v.fail;
+        if (total < minSamples) continue;
+        const taxa = v.ok / total;
+        if (taxa >= minRate) out.push({ model, kinds: [kind], verdict: "bom" });
+        else if (taxa <= maxRate) out.push({ model, kinds: [kind], verdict: "ruim" });
+      }
+    }
+    return out;
+  }
+
   // ---------------------------------------------------------- handoffs
 
   async handoffOpen(input: { title: string; body: string; tags?: string[] }): Promise<Page> {
@@ -719,32 +919,53 @@ export class MemoryStore {
   }
 
   /** reivindica exatamente uma vez: O_EXCL no arquivo de claim */
-  claimHandoff(needle: string, claimedBy: string): { ok: boolean; page?: Page; reason?: string } {
-    const p = this.find(needle);
-    if (!p) return { ok: false, reason: `handoff nao encontrado: ${needle}` };
-    if (p.type !== "handoff") return { ok: false, reason: `${p.rel} nao e um handoff` };
-    if ((p.status ?? "open") === "claimed") return { ok: false, reason: `ja reivindicado por ${p.owner ?? "?"}` };
-    const claimPath = path.join(this.dir, "claims", `${slugify(p.title)}.claim`);
-    fs.mkdirSync(path.dirname(claimPath), { recursive: true });
-    try {
-      const fd = fs.openSync(claimPath, "wx");
-      fs.writeSync(fd, JSON.stringify({ by: claimedBy, at: nowIso() }));
-      fs.closeSync(fd);
-    } catch {
-      return { ok: false, reason: "claim concorrente: outra sessao chegou primeiro" };
-    }
-    p.status = "claimed";
-    p.owner = claimedBy;
-    p.validTo = undefined;
-    fs.writeFileSync(path.join(this.pagesDir, p.rel), renderPage(p));
-    this.load(true);
-    return { ok: true, page: p };
+  async claimHandoff(needle: string, claimedBy: string): Promise<{ ok: boolean; page?: Page; reason?: string }> {
+    return this.locked(() => {
+      this.load(true);
+      const p = this.find(needle);
+      if (!p) return { ok: false, reason: `handoff nao encontrado: ${needle}` };
+      if (p.type !== "handoff") return { ok: false, reason: `${p.rel} nao e um handoff` };
+      if ((p.status ?? "open") === "claimed") return { ok: false, reason: `ja reivindicado por ${p.owner ?? "?"}` };
+      const claimPath = path.join(this.dir, "claims", `${slugify(p.title)}.claim`);
+      fs.mkdirSync(path.dirname(claimPath), { recursive: true });
+      try {
+        const fd = fs.openSync(claimPath, "wx");
+        fs.writeSync(fd, JSON.stringify({ by: claimedBy, at: nowIso() }));
+        fs.closeSync(fd);
+      } catch {
+        return { ok: false, reason: "claim concorrente: outra sessao chegou primeiro" };
+      }
+      p.status = "claimed";
+      p.owner = frontmatterSafe(claimedBy, 120);
+      p.validTo = undefined;
+      writeAtomic(path.join(this.pagesDir, p.rel), renderPage(p));
+      auditAppend(this.dir, { event: "handoff.claim", rel: p.rel, actor: claimedBy });
+      this.load(true);
+      return { ok: true, page: p };
+    });
   }
 }
 
 function snippet(p: Page): string {
   const clean = p.body.replace(/\[\[([^\]]+)\]\]/g, "$1").replace(/\s+/g, " ").trim();
   return clean.length > 240 ? `${clean.slice(0, 237)}...` : clean;
+}
+
+/** linha de resumo para briefing: titulo + resumo (corpo so sob demanda, progressive disclosure) */
+function briefLine(p: Page): string {
+  return `- [${p.rel}] ${p.title}${p.summary ? ` — ${p.summary}` : ""}`;
+}
+
+/** le a tabela do placar de uma pagina model-profile */
+function parsePlacar(body: string): Record<string, { ok: number; fail: number; last: string }> {
+  const out: Record<string, { ok: number; fail: number; last: string }> = {};
+  for (const line of body.split(/\r?\n/)) {
+    const m = line.match(/^\|\s*([\w.\-/]+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*([\d-]+)?\s*\|\s*$/);
+    if (!m) continue;
+    if (m[1] === "modelo" || m[1].startsWith("---")) continue;
+    out[m[1]] = { ok: Number(m[2]), fail: Number(m[3]), last: m[4] ?? "" };
+  }
+  return out;
 }
 
 export function memoryStats(store: MemoryStore): string {

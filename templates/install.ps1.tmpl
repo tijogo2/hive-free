@@ -37,7 +37,8 @@ __FREEHIVE_B64_PAYLOAD__
 
 $ExpectedModels = @(
   'mimo-2.6-pro', 'deepseek-v4.1-flash', 'glm-5.3-flash', 'mimo-2.6-flash',
-  'gpt-6-luna', 'crouton-alpha', 'glyph-cluster', 'solar-mini-4', 'deepai-cyber'
+  'qwen-3.8-flash', 'minimax-m3.1-flash', 'gpt-6-luna', 'glyph-cluster',
+  'solar-mini-4', 'deepai-cyber'
 )
 
 function Write-Info($msg)  { Write-Host $msg }
@@ -114,7 +115,7 @@ function Show-ModelCheck {
     }
     $missing = @($ExpectedModels | Where-Object { $ids -notcontains $_ })
     if ($missing.Count -eq 0) {
-      Write-Ok 'Catalogo OK: os 9 modelos gratuitos estao disponiveis.'
+      Write-Ok 'Catalogo OK: os 10 modelos gratuitos estao disponiveis.'
     } else {
       Write-Warn2 ('Aviso: modelos gratuitos ausentes nesta conta: ' + ($missing -join ', '))
       Write-Warn2 "       O enxame usa os que existirem; '/hive models' mostra a lista."

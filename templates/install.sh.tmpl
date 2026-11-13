@@ -21,7 +21,7 @@
 set -euo pipefail
 
 VERSION="__VERSION__"
-EXPECTED_MODELS="mimo-2.6-pro deepseek-v4.1-flash glm-5.3-flash mimo-2.6-flash gpt-6-luna crouton-alpha glyph-cluster solar-mini-4 deepai-cyber"
+EXPECTED_MODELS="mimo-2.6-pro deepseek-v4.1-flash glm-5.3-flash mimo-2.6-flash qwen-3.8-flash minimax-m3.1-flash gpt-6-luna glyph-cluster solar-mini-4 deepai-cyber"
 USERDATA="$HOME/.deepai-code/userdata"
 
 HERE=""
@@ -135,7 +135,7 @@ show_model_check() {
     grep -q "\"$model\"" "$file" || missing="$missing $model"
   done
   if [ -z "$missing" ]; then
-    echo "Catalogo OK: os 9 modelos gratuitos estao disponiveis."
+    echo "Catalogo OK: os 10 modelos gratuitos estao disponiveis."
   else
     echo "Aviso: modelos gratuitos ausentes nesta conta:$missing"
     echo "       O enxame usa os que existirem; '/hive models' mostra a lista."
