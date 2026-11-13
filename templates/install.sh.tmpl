@@ -5,7 +5,7 @@
 # Node/npm: o pi transpila TypeScript em tempo de carga.
 #
 # Instalar (uma linha, direto de uma URL):
-#   curl -fsSL https://raw.githubusercontent.com/SEU-USUARIO/free-hive/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/tijogo2/free-hive/main/install.sh | bash
 #
 # Instalar a partir de um arquivo baixado:
 #   chmod +x install.sh && ./install.sh

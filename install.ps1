@@ -5,7 +5,7 @@
   Node/npm, nao precisa de package.json: o pi transpila TypeScript em tempo de carga.
 
   Instalar (uma linha, direto de uma URL):
-    irm https://raw.githubusercontent.com/SEU-USUARIO/free-hive/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/tijogo2/free-hive/main/install.ps1 | iex
 
   Instalar a partir de um arquivo baixado:
     powershell -ExecutionPolicy Bypass -File .\install.ps1
